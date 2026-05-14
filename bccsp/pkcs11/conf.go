@@ -11,7 +11,7 @@ import "time"
 const (
 	defaultCreateSessionRetries    = 10
 	defaultCreateSessionRetryDelay = 100 * time.Millisecond
-	defaultSessionCacheSize        = 10
+	defaultSessionCacheSize        = 30
 )
 
 // PKCS11Opts contains options for the P11Factory
@@ -21,15 +21,17 @@ type PKCS11Opts struct {
 	Hash     string `json:"hash"`
 
 	// PKCS11 options
-	Library        string         `json:"library"`
-	Label          string         `json:"label"`
-	Pin            string         `json:"pin"`
-	SoftwareVerify bool           `json:"softwareverify,omitempty"`
-	Immutable      bool           `json:"immutable,omitempty"`
-	AltID          string         `json:"altid,omitempty"`
-	KeyIDs         []KeyIDMapping `json:"keyids,omitempty" mapstructure:"keyids"`
+	Library          string         `json:"library"`
+	Label            string         `json:"label"`
+	Pin              string         `json:"pin"`
+	SoftwareVerify   bool           `json:"softwareverify,omitempty"`
+	Immutable        bool           `json:"immutable,omitempty"`
+	AltID            string         `json:"altid,omitempty"`
+	KeyIDs           []KeyIDMapping `json:"keyids,omitempty" mapstructure:"keyids"`
+	SessionCacheSize uint           `json:"session_cache_size"`
 
-	sessionCacheSize        int
+	// createSessionRetries / createSessionRetryDelay are internal overrides
+	// intended for tests.
 	createSessionRetries    int
 	createSessionRetryDelay time.Duration
 }

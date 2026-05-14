@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package pkcs11
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/sha256"
@@ -26,6 +27,7 @@ import (
 	"github.com/miekg/pkcs11"
 	"github.com/pkg/errors"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/sync/semaphore"
 )
 
 var (
@@ -49,6 +51,11 @@ type Provider struct {
 
 	sessLock sync.Mutex
 	sessPool chan pkcs11.SessionHandle
+	// sessSem bounds the number of concurrently outstanding (checked-out)
+	// sessions. Cached sessions in sessPool do not hold a slot; the slot is
+	// released on returnSession (when the session is cached) or on
+	// closeSession.
+	sessSem  *semaphore.Weighted
 	sessions map[pkcs11.SessionHandle]struct{}
 
 	cacheLock   sync.RWMutex
@@ -90,19 +97,11 @@ func New(opts PKCS11Opts, keyStore bccsp.KeyStore, options ...Option) (*Provider
 		return nil, errors.Wrapf(err, "Failed initializing fallback SW BCCSP")
 	}
 
-	if opts.sessionCacheSize == 0 {
-		opts.sessionCacheSize = defaultSessionCacheSize
-	}
 	if opts.createSessionRetries == 0 {
 		opts.createSessionRetries = defaultCreateSessionRetries
 	}
 	if opts.createSessionRetryDelay == 0 {
 		opts.createSessionRetryDelay = defaultCreateSessionRetryDelay
-	}
-
-	var sessPool chan pkcs11.SessionHandle
-	if opts.sessionCacheSize > 0 {
-		sessPool = make(chan pkcs11.SessionHandle, opts.sessionCacheSize)
 	}
 
 	csp := &Provider{
@@ -111,8 +110,6 @@ func New(opts PKCS11Opts, keyStore bccsp.KeyStore, options ...Option) (*Provider
 		getKeyIDForSKI:          func(ski []byte) []byte { return ski },
 		createSessionRetries:    opts.createSessionRetries,
 		createSessionRetryDelay: opts.createSessionRetryDelay,
-		sessPool:                sessPool,
-		sessions:                map[pkcs11.SessionHandle]struct{}{},
 		handleCache:             map[string]pkcs11.ObjectHandle{},
 		keyCache:                map[string]bccsp.Key{},
 		softVerify:              opts.SoftwareVerify,
@@ -132,6 +129,14 @@ func (csp *Provider) initialize(opts PKCS11Opts) (*Provider, error) {
 	if opts.Library == "" {
 		return nil, fmt.Errorf("pkcs11: library path not provided")
 	}
+
+	cacheSize := int(opts.SessionCacheSize)
+	if cacheSize == 0 {
+		cacheSize = defaultSessionCacheSize
+	}
+	csp.sessPool = make(chan pkcs11.SessionHandle, cacheSize)
+	csp.sessSem = semaphore.NewWeighted(int64(cacheSize))
+	csp.sessions = map[pkcs11.SessionHandle]struct{}{}
 
 	ctx := pkcs11.New(opts.Library)
 	if ctx == nil {
@@ -161,7 +166,7 @@ func (csp *Provider) initialize(opts PKCS11Opts) (*Provider, error) {
 		csp.ctx = ctx
 		csp.pin = opts.Pin
 
-		session, err := csp.createSession()
+		session, err := csp.getSession()
 		if err != nil {
 			return nil, err
 		}
@@ -329,16 +334,37 @@ func (csp *Provider) verifyECDSA(k ecdsaPublicKey, signature, digest []byte) (bo
 	return csp.verifyP11ECDSA(k.ski, digest, r, s, k.pub.Curve.Params().BitSize/8)
 }
 
+// getSession returns a session for the caller to use. If a cached session is
+// available it is returned; otherwise a new session is opened, gated by the
+// sessSem semaphore so the number of concurrently outstanding sessions never
+// exceeds SessionCacheSize.
+//
+// Slot accounting:
+//   - Acquire one slot up front, before either reusing a cached session or
+//     opening a new one. The slot represents the resulting outstanding session.
+//   - returnSession releases the slot when the session is successfully cached.
+//   - closeSession releases the slot when a known session is closed.
+//
+// This intentionally keeps cached sessions out of the slot count: a session
+// sitting in sessPool is not in-flight and should not block a caller waiting
+// for a slot. A caller that subsequently pulls that cached session out will
+// reacquire its own slot.
 func (csp *Provider) getSession() (session pkcs11.SessionHandle, err error) {
-	for {
-		select {
-		case session = <-csp.sessPool:
-			return
-		default:
-			// cache is empty (or completely in use), create a new session
-			return csp.createSession()
-		}
+	if err = csp.sessSem.Acquire(context.Background(), 1); err != nil {
+		return 0, errors.Wrap(err, "acquire session slot")
 	}
+
+	select {
+	case session = <-csp.sessPool:
+		return session, nil
+	default:
+	}
+
+	session, err = csp.createSession()
+	if err != nil {
+		csp.sessSem.Release(1)
+	}
+	return session, err
 }
 
 func (csp *Provider) createSession() (pkcs11.SessionHandle, error) {
@@ -379,21 +405,44 @@ func (csp *Provider) closeSession(session pkcs11.SessionHandle) {
 	}
 
 	csp.sessLock.Lock()
-	defer csp.sessLock.Unlock()
 
-	// purge the handle cache if the last session closes
+	// Only release the semaphore slot when the session was previously tracked
+	// in csp.sessions. This guards against double-release when closeSession is
+	// invoked for a partially-opened session (e.g. OpenSession succeeded but
+	// Login subsequently failed and the caller closed the bare session before
+	// it was registered).
+	_, known := csp.sessions[session]
 	delete(csp.sessions, session)
+	// purge the handle cache if the last session closes
 	if len(csp.sessions) == 0 {
 		csp.clearCaches()
+	}
+	csp.sessLock.Unlock()
+
+	if known {
+		csp.sessSem.Release(1)
 	}
 }
 
 func (csp *Provider) returnSession(session pkcs11.SessionHandle) {
+	// A slot was only acquired for sessions registered by createSession.
+	// Callers may also hand us a foreign handle (e.g. tests deliberately
+	// inject a bogus value to exercise CKR_SESSION_HANDLE_INVALID handling),
+	// for which no slot was ever taken. Gate the Release on registration so
+	// the semaphore stays balanced with Acquire.
+	csp.sessLock.Lock()
+	_, known := csp.sessions[session]
+	csp.sessLock.Unlock()
+
 	select {
 	case csp.sessPool <- session:
-		// returned session back to session cache
+		// Cached. Release the slot only if we acquired one for this session.
+		if known {
+			csp.sessSem.Release(1)
+		}
 	default:
-		// have plenty of sessions in cache, dropping
+		// Cache is full; close the session. closeSession releases the slot
+		// for known sessions.
 		csp.closeSession(session)
 	}
 }
